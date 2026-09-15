@@ -1,0 +1,280 @@
+package com.example.sticker_manager
+
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodChannel
+import java.io.File
+import java.security.MessageDigest
+import org.json.JSONArray
+import org.json.JSONObject
+
+class MainActivity : FlutterActivity() {
+    private val channelName = "sticker_manager/platform"
+    private val shareEventChannelName = "sticker_manager/share_events"
+    private val pendingFiles = mutableListOf<String>()
+    private val pendingIntentFiles = mutableMapOf<String, MutableList<String>>()
+    private var pendingFilesLoaded = false
+    private var shareEventSink: EventChannel.EventSink? = null
+    private var lastCapturedIntentIdentity: Int? = null
+
+    private val pendingFilePreferences by lazy {
+        getSharedPreferences(SHARE_PREFERENCES, MODE_PRIVATE)
+    }
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        loadPendingFiles()
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, shareEventChannelName)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    shareEventSink = events
+                    loadPendingFiles()
+                    if (pendingFiles.isNotEmpty()) {
+                        events?.success(pendingFiles.toList())
+                    }
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    shareEventSink = null
+                }
+            })
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "initialize" -> { captureIntent(intent); result.success(null) }
+                "consumeSharedFiles" -> {
+                    loadPendingFiles()
+                    result.success(pendingFiles.toList())
+                }
+                "ackSharedFiles" -> {
+                    val files = call.argument<List<String>>("files") ?: emptyList()
+                    acknowledgeSharedFiles(files)
+                    result.success(null)
+                }
+                "pasteSticker" -> {
+                    val filePath = call.argument<String>("path")
+                    result.success(filePath != null && copyToClipboard(filePath))
+                }
+                "isOverlayGranted" -> result.success(Settings.canDrawOverlays(this))
+                "isFloatingPanelRunning" -> result.success(FloatingPanelService.running)
+                "peekFloatingUsage" -> {
+                    result.success(FloatingPanelService.peekUsageEvents(this))
+                }
+                "ackFloatingUsage" -> {
+                    val ids = call.argument<List<String>>("ids") ?: emptyList()
+                    FloatingPanelService.ackUsageEvents(this, ids)
+                    result.success(null)
+                }
+                "startFloatingPanel" -> {
+                    if (!Settings.canDrawOverlays(this)) {
+                        result.success(false)
+                    } else {
+                        val stickers = call.argument<List<Map<String, Any?>>>("stickers") ?: emptyList()
+                        FloatingPanelService.updateStickers(this, stickers)
+                        try {
+                            if (FloatingPanelService.requestStart()) {
+                                val serviceIntent = Intent(this, FloatingPanelService::class.java)
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                    ContextCompat.startForegroundService(this, serviceIntent)
+                                } else {
+                                    startService(serviceIntent)
+                                }
+                            }
+                            result.success(true)
+                        } catch (error: Throwable) {
+                            FloatingPanelService.cancelStartRequest()
+                            result.error(
+                                "floating_panel_start_failed",
+                                error.message ?: "无法启动悬浮面板",
+                                null,
+                            )
+                        }
+                    }
+                }
+                "stopFloatingPanel" -> {
+                    FloatingPanelService.requestStop()
+                    stopService(Intent(this, FloatingPanelService::class.java))
+                    result.success(true)
+                }
+                "syncFloatingPanel" -> {
+                    val stickers = call.argument<List<Map<String, Any?>>>("stickers") ?: emptyList()
+                    FloatingPanelService.updateStickers(this, stickers)
+                    result.success(null)
+                }
+                "openOverlaySettings" -> {
+                    val settingsIntent = Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName"),
+                    )
+                    startActivity(settingsIntent)
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        captureIntent(intent)
+    }
+
+    private fun captureIntent(source: Intent?) {
+        if (source == null) return
+        if (source.action != Intent.ACTION_SEND && source.action != Intent.ACTION_SEND_MULTIPLE) return
+        val identity = System.identityHashCode(source)
+        if (lastCapturedIntentIdentity == identity) return
+        lastCapturedIntentIdentity = identity
+        loadPendingFiles()
+        val uris = mutableListOf<Uri>()
+        source.extras?.get(Intent.EXTRA_STREAM)?.let { stream ->
+            when (stream) {
+                is Uri -> uris.add(stream)
+                is List<*> -> uris.addAll(stream.filterIsInstance<Uri>())
+            }
+        }
+        source.clipData?.let { clipData ->
+            for (index in 0 until clipData.itemCount) {
+                clipData.getItemAt(index).uri?.let { uris.add(it) }
+            }
+        }
+        source.data?.let { uris.add(it) }
+        val fingerprint = intentFingerprint(source, uris)
+        val previousFiles = pendingIntentFiles[fingerprint]
+            ?.filter { pendingFiles.contains(it) && File(it).exists() }
+            ?: emptyList()
+        if (previousFiles.isNotEmpty()) return
+        pendingIntentFiles.remove(fingerprint)
+        val captured = mutableListOf<String>()
+        uris.distinct().forEach { uri ->
+            var copiedFile: File? = null
+            runCatching {
+                val extension = safeShareExtension(uri)
+                val file = File(cacheDir, "shared_${System.nanoTime()}.$extension")
+                copiedFile = file
+                val input = contentResolver.openInputStream(uri)
+                    ?: error("无法读取分享文件")
+                input.use { stream -> file.outputStream().use { stream.copyTo(it) } }
+                if (file.exists() && file.length() > 0) {
+                    if (!pendingFiles.contains(file.absolutePath)) {
+                        pendingFiles.add(file.absolutePath)
+                        captured.add(file.absolutePath)
+                    }
+                }
+            }.onFailure {
+                copiedFile?.delete()
+            }
+        }
+        if (captured.isNotEmpty()) {
+            pendingIntentFiles[fingerprint] = captured.toMutableList()
+        }
+        persistPendingFiles()
+        if (captured.isNotEmpty()) shareEventSink?.success(captured)
+    }
+
+    private fun safeShareExtension(uri: Uri): String {
+        val candidate = contentResolver.getType(uri)
+            ?.substringAfterLast('/')
+            ?.lowercase()
+            ?.takeIf { it.matches(Regex("[a-z0-9]{1,10}")) }
+        return candidate ?: "bin"
+    }
+
+    private fun intentFingerprint(source: Intent, uris: List<Uri>): String {
+        val parts = listOf(
+            source.action.orEmpty(),
+            source.type.orEmpty(),
+            source.data?.toString().orEmpty(),
+            uris.distinct().map(Uri::toString).sorted().joinToString("\u001f"),
+        )
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(parts.joinToString("\u001e").toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { byte ->
+            "%02x".format(byte.toInt() and 0xff)
+        }
+    }
+
+    private fun loadPendingFiles() {
+        if (pendingFilesLoaded) return
+        pendingFilesLoaded = true
+        val encoded = pendingFilePreferences.getString(PENDING_FILES_KEY, null)
+            ?: return
+        runCatching {
+            val files = JSONArray(encoded)
+            for (index in 0 until files.length()) {
+                files.optString(index).takeIf { it.isNotBlank() }?.let {
+                    pendingFiles.add(it)
+                }
+            }
+        }
+        val intents = pendingFilePreferences.getString(PENDING_INTENTS_KEY, null)
+        if (!intents.isNullOrBlank()) {
+            runCatching {
+                val mappings = JSONObject(intents)
+                val keys = mappings.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    val files = mappings.optJSONArray(key) ?: continue
+                    val paths = mutableListOf<String>()
+                    for (index in 0 until files.length()) {
+                        files.optString(index).takeIf { it.isNotBlank() }?.let(paths::add)
+                    }
+                    if (paths.isNotEmpty()) pendingIntentFiles[key] = paths
+                }
+            }
+        }
+    }
+
+    private fun persistPendingFiles() {
+        val encoded = JSONArray().apply {
+            pendingFiles.distinct().forEach { put(it) }
+        }.toString()
+        val mappings = JSONObject()
+        pendingIntentFiles.forEach { (key, files) ->
+            val valid = files.filter { pendingFiles.contains(it) }
+            if (valid.isNotEmpty()) {
+                mappings.put(key, JSONArray(valid))
+            }
+        }
+        pendingFilePreferences.edit()
+            .putString(PENDING_FILES_KEY, encoded)
+            .putString(PENDING_INTENTS_KEY, mappings.toString())
+            .commit()
+    }
+
+    private fun acknowledgeSharedFiles(files: List<String>) {
+        loadPendingFiles()
+        if (files.isEmpty()) return
+        pendingFiles.removeAll(files.toSet())
+        pendingIntentFiles.entries.removeIf { (_, paths) ->
+            paths.removeAll(files.toSet())
+            paths.isEmpty()
+        }
+        persistPendingFiles()
+    }
+
+    private fun copyToClipboard(filePath: String): Boolean {
+        val file = File(filePath)
+        if (!file.exists()) return false
+        val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", file)
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newUri(contentResolver, "sticker", uri))
+        return true
+    }
+
+    companion object {
+        private const val SHARE_PREFERENCES = "sticker_manager_share_queue"
+        private const val PENDING_FILES_KEY = "pending_files"
+        private const val PENDING_INTENTS_KEY = "pending_intents"
+    }
+}
