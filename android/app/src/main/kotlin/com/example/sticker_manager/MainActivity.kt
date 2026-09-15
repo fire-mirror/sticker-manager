@@ -4,8 +4,10 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.database.Cursor
 import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -23,6 +25,7 @@ class MainActivity : FlutterActivity() {
     private val shareEventChannelName = "sticker_manager/share_events"
     private val pendingFiles = mutableListOf<String>()
     private val pendingIntentFiles = mutableMapOf<String, MutableList<String>>()
+    private val pendingShareErrors = mutableListOf<String>()
     private var pendingFilesLoaded = false
     private var shareEventSink: EventChannel.EventSink? = null
     private var lastCapturedIntentIdentity: Int? = null
@@ -59,6 +62,13 @@ class MainActivity : FlutterActivity() {
                     val files = call.argument<List<String>>("files") ?: emptyList()
                     acknowledgeSharedFiles(files)
                     result.success(null)
+                }
+                "consumeShareErrors" -> {
+                    loadPendingFiles()
+                    val errors = pendingShareErrors.toList()
+                    pendingShareErrors.clear()
+                    persistPendingFiles()
+                    result.success(errors)
                 }
                 "pasteSticker" -> {
                     val filePath = call.argument<String>("path")
@@ -156,23 +166,26 @@ class MainActivity : FlutterActivity() {
         if (previousFiles.isNotEmpty()) return
         pendingIntentFiles.remove(fingerprint)
         val captured = mutableListOf<String>()
+        var copiedBytes = 0L
         uris.distinct().forEach { uri ->
-            var copiedFile: File? = null
-            runCatching {
-                val extension = safeShareExtension(uri)
-                val file = File(cacheDir, "shared_${System.nanoTime()}.$extension")
-                copiedFile = file
-                val input = contentResolver.openInputStream(uri)
-                    ?: error("无法读取分享文件")
-                input.use { stream -> file.outputStream().use { stream.copyTo(it) } }
-                if (file.exists() && file.length() > 0) {
-                    if (!pendingFiles.contains(file.absolutePath)) {
-                        pendingFiles.add(file.absolutePath)
-                        captured.add(file.absolutePath)
-                    }
-                }
-            }.onFailure {
-                copiedFile?.delete()
+            if (copiedBytes >= MAX_SHARED_TOTAL_BYTES) {
+                recordShareError("分享文件总大小超过 ${formatBytes(MAX_SHARED_TOTAL_BYTES)}，已停止接收")
+                return@forEach
+            }
+            val extension = safeShareExtension(uri)
+            val file = File(cacheDir, "shared_${System.nanoTime()}.$extension")
+            val copy = copyUriBounded(uri, file, MAX_SHARED_TOTAL_BYTES - copiedBytes)
+            if (copy.error != null) {
+                file.delete()
+                recordShareError(copy.error)
+                return@forEach
+            }
+            copiedBytes += copy.bytes
+            if (copy.bytes > 0L && !pendingFiles.contains(file.absolutePath)) {
+                pendingFiles.add(file.absolutePath)
+                captured.add(file.absolutePath)
+            } else {
+                file.delete()
             }
         }
         if (captured.isNotEmpty()) {
@@ -180,6 +193,104 @@ class MainActivity : FlutterActivity() {
         }
         persistPendingFiles()
         if (captured.isNotEmpty()) shareEventSink?.success(captured)
+    }
+
+    /**
+     * Copies a shared URI without ever reading more than the per-file or
+     * remaining batch budget. Some providers do not expose a size in their
+     * metadata, so the stream itself is still checked while it is copied.
+     */
+    private fun copyUriBounded(uri: Uri, destination: File, remainingBytes: Long): CopyResult {
+        val knownSize = queryUriSize(uri)
+        if (knownSize != null && knownSize > MAX_SHARED_FILE_BYTES) {
+            return CopyResult(
+                0L,
+                "分享文件超过单文件限制 ${formatBytes(MAX_SHARED_FILE_BYTES)}，已跳过",
+            )
+        }
+        if (knownSize != null && knownSize > remainingBytes) {
+            return CopyResult(
+                0L,
+                "分享文件总大小超过 ${formatBytes(MAX_SHARED_TOTAL_BYTES)}，已跳过超出部分",
+            )
+        }
+        val streamLimit = minOf(MAX_SHARED_FILE_BYTES, remainingBytes)
+        if (streamLimit <= 0L) {
+            return CopyResult(0L, "分享文件总大小超过 ${formatBytes(MAX_SHARED_TOTAL_BYTES)}")
+        }
+        var copied = 0L
+        return try {
+            val input = contentResolver.openInputStream(uri)
+                ?: return CopyResult(0L, "无法读取分享文件")
+            input.use { source ->
+                destination.outputStream().use { output ->
+                    val buffer = ByteArray(SHARE_COPY_BUFFER_BYTES)
+                    while (true) {
+                        val count = source.read(buffer)
+                        if (count < 0) break
+                        if (count == 0) continue
+                        if (copied > streamLimit - count.toLong()) {
+                            return CopyResult(
+                                0L,
+                                if (copied >= MAX_SHARED_FILE_BYTES) {
+                                    "分享文件超过单文件限制 ${formatBytes(MAX_SHARED_FILE_BYTES)}，已跳过"
+                                } else {
+                                    "分享文件总大小超过 ${formatBytes(MAX_SHARED_TOTAL_BYTES)}，已跳过超出部分"
+                                },
+                            )
+                        }
+                        output.write(buffer, 0, count)
+                        copied += count
+                    }
+                }
+            }
+            if (copied == 0L) CopyResult(0L, "分享文件为空，已跳过")
+            else CopyResult(copied)
+        } catch (error: Throwable) {
+            CopyResult(0L, "无法读取分享文件：${error.message ?: "未知错误"}")
+        }
+    }
+
+    private fun queryUriSize(uri: Uri): Long? {
+        var cursor: Cursor? = null
+        return try {
+            cursor = contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.SIZE),
+                null,
+                null,
+                null,
+            )
+            if (cursor != null && cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (index >= 0 && !cursor.isNull(index)) {
+                    cursor.getLong(index).takeIf { it >= 0L }
+                } else {
+                    // Providers commonly use -1 to mean that the size is
+                    // unknown. Let the bounded stream check handle it.
+                    null
+                }
+            } else {
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            cursor?.close()
+        }
+    }
+
+    private fun recordShareError(message: String) {
+        if (message.isBlank()) return
+        pendingShareErrors.add(message)
+        if (pendingShareErrors.size > MAX_SHARE_ERRORS) {
+            pendingShareErrors.removeAt(0)
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        val megabytes = bytes / (1024L * 1024L)
+        return "${megabytes}MiB"
     }
 
     private fun safeShareExtension(uri: Uri): String {
@@ -208,12 +319,13 @@ class MainActivity : FlutterActivity() {
         if (pendingFilesLoaded) return
         pendingFilesLoaded = true
         val encoded = pendingFilePreferences.getString(PENDING_FILES_KEY, null)
-            ?: return
-        runCatching {
-            val files = JSONArray(encoded)
-            for (index in 0 until files.length()) {
-                files.optString(index).takeIf { it.isNotBlank() }?.let {
-                    pendingFiles.add(it)
+        if (!encoded.isNullOrBlank()) {
+            runCatching {
+                val files = JSONArray(encoded)
+                for (index in 0 until files.length()) {
+                    files.optString(index).takeIf { it.isNotBlank() }?.let {
+                        pendingFiles.add(it)
+                    }
                 }
             }
         }
@@ -233,6 +345,17 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+        val errors = pendingFilePreferences.getString(PENDING_ERRORS_KEY, null)
+        if (!errors.isNullOrBlank()) {
+            runCatching {
+                val values = JSONArray(errors)
+                for (index in 0 until values.length()) {
+                    values.optString(index).takeIf { it.isNotBlank() }?.let {
+                        pendingShareErrors.add(it)
+                    }
+                }
+            }
+        }
     }
 
     private fun persistPendingFiles() {
@@ -249,6 +372,7 @@ class MainActivity : FlutterActivity() {
         pendingFilePreferences.edit()
             .putString(PENDING_FILES_KEY, encoded)
             .putString(PENDING_INTENTS_KEY, mappings.toString())
+            .putString(PENDING_ERRORS_KEY, JSONArray(pendingShareErrors).toString())
             .commit()
     }
 
@@ -265,16 +389,27 @@ class MainActivity : FlutterActivity() {
 
     private fun copyToClipboard(filePath: String): Boolean {
         val file = File(filePath)
-        if (!file.exists()) return false
-        val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", file)
-        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clipboard.setPrimaryClip(ClipData.newUri(contentResolver, "sticker", uri))
-        return true
+        if (!file.exists() || file.length() <= 0L || file.length() > MAX_SHARED_FILE_BYTES) {
+            return false
+        }
+        return runCatching {
+            val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", file)
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newUri(contentResolver, "sticker", uri))
+            true
+        }.getOrDefault(false)
     }
+
+    private data class CopyResult(val bytes: Long, val error: String? = null)
 
     companion object {
         private const val SHARE_PREFERENCES = "sticker_manager_share_queue"
         private const val PENDING_FILES_KEY = "pending_files"
         private const val PENDING_INTENTS_KEY = "pending_intents"
+        private const val PENDING_ERRORS_KEY = "pending_errors"
+        private const val MAX_SHARED_FILE_BYTES = 64L * 1024L * 1024L
+        private const val MAX_SHARED_TOTAL_BYTES = 512L * 1024L * 1024L
+        private const val SHARE_COPY_BUFFER_BYTES = 64 * 1024
+        private const val MAX_SHARE_ERRORS = 128
     }
 }

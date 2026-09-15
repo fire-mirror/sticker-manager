@@ -34,7 +34,7 @@ Flutter 业务层不直接依赖具体平台 API。`StickerRepository` 和 `Impo
 - `ExportPackageService`：把数据库元数据与媒体写入版本化归档，调用 `EncryptedPackageCodec` 加密；导入时校验 manifest 和媒体哈希后恢复。
 - `AppPreferences`：热键配置、剪贴板兼容性记录等小型设置使用本地偏好存储。
 
-导入的并发边界是准备阶段最多 4 个 worker，缩略图阶段最多 2 个 worker；数据库提交使用单个事务。`onRecordsCommitted` 用于让 UI 在缩略图完成前刷新卡片。
+导入的并发边界是准备阶段最多 4 个 worker，缩略图阶段最多 2 个 worker；每个文件最多 64 MiB、每批最多 512 MiB，数据库提交使用单个事务。`onRecordsCommitted` 用于让 UI 在缩略图完成前刷新卡片。
 
 ## 3. 持久化层
 
@@ -63,7 +63,7 @@ sticker_groups
 
 ### 启动与单实例
 
-`windows/runner/main.cpp` 创建命名互斥体 `Local\StickerManager.SingleInstance`。重复启动等待首个窗口就绪并激活它，然后退出，不创建第二个 Flutter 窗口。主窗口关闭消息被解释为隐藏到托盘；托盘退出动作才结束进程。
+`windows/runner/main.cpp` 创建命名互斥体 `Local\StickerManager.SingleInstance`。重复启动等待首个窗口就绪并激活它，同时发送恢复主管理模式的窗口消息，然后退出，不创建第二个 Flutter 窗口。主窗口关闭消息被解释为隐藏到托盘；托盘退出动作才结束进程。
 
 ### 托盘与热键
 
@@ -94,6 +94,7 @@ runner 的 `flutter_window.cpp` 通过 GDI+ 解码静态图并写入 `CF_DIB`/`C
 `MainActivity.kt` 注册 `sticker_manager/platform` MethodChannel 和 `sticker_manager/share_events` EventChannel：
 
 - `ACTION_SEND`/`ACTION_SEND_MULTIPLE` 接收图片 URI，复制到应用 cache，按 action、MIME、URI 集合生成指纹，持久化待导入队列；Flutter 成功确认后调用 `ackSharedFiles` 清理。
+- 分享复制使用 64 KiB 缓冲区和 64 MiB 单文件、512 MiB 批次上限；超限或读取失败原因持久化到队列，并由 Flutter 在下次打开时提示。
 - `pasteSticker` 通过 `FileProvider` 生成 URI，写入 Android `ClipboardManager`。
 - 悬浮面板相关方法检查 overlay 权限、同步最多 100 条排序结果、启动或停止前台服务。
 

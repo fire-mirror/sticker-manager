@@ -2,6 +2,41 @@
 
 本项目按用户可见行为和兼容性记录变更。日期采用 `YYYY-MM-DD`；测试条目只记录已经执行或明确标注为待执行的内容。
 
+## 2026-09-15 发布前修复与验证
+
+### 修复
+
+- Windows 发送目标在原生 `WM_HOTKEY` 和托盘按下阶段捕获，并校验 HWND 所属进程、窗口类名和标题；目标失效时只在原进程内有限重解析，避免把粘贴和回车发送到错误窗口。
+- Windows 重复启动只激活现有实例并恢复主管理模式，不再产生第二个项目进程、托盘图标或全局热键。
+- Windows/Android 导入增加单文件 `64 MiB`、批次 `512 MiB` 上限；分享 URI 使用有界流读取，超限和读取失败会在应用中提示。
+- 加密迁移包增加密文 `768 MiB`、明文 `512 MiB` 上限，以及 manifest、媒体类型、哈希、分组 ID 和路径校验；导入完成后释放已处理归档内容。
+- 发布脚本优先读取 `flutter config --machine` 中的 JDK 和 Android SDK。此次 Android 构建使用 JDK 17.0.20.1，不依赖系统 Java 11。
+
+### 构建产物
+
+- Windows x64 便携包：`dist/sticker-manager-windows-x64-0.1.0+1.zip`
+  - SHA-256：`AF9D9F82FE67142A16CF6C0E68FC04D5B8731FA07712D3237513A8DFC734DDA6`
+- Android APK：`build/app/outputs/flutter-apk/app-release.apk`
+  - SHA-256：`DDE2ABDD0CE5D1DEC6777EC50BCB1690745B6EBEFAE38FBFA8324BD3F7294C21`
+  - `minSdkVersion 28`、`targetSdkVersion 36`，包含 `arm64-v8a`、`armeabi-v7a` 和 `x86_64`。
+  - 当前使用 Android Debug 证书，仅用于测试；`com.example.sticker_manager` 仍是示例 applicationId，公开分发前必须更换签名和 applicationId。
+
+### 已执行验证
+
+- `flutter analyze --no-pub`：通过。
+- `flutter test --no-pub`：28 项通过。
+- `flutter build windows --release --no-pub`：通过。
+- `flutter build apk --release --target-platform android-arm64 --no-pub`：通过。
+- Windows 单实例并发启动检查：最终只保留 1 个项目进程。
+- Windows 便携包内容检查：未包含临时截图、数据库、日志或密钥文件。
+- Android APK v2 签名和 ABI/min SDK 检查：通过。
+
+### 尚待设备复测
+
+- QQNT、传统 QQ 和微信桌面版的真实窗口焦点、静态图/GIF 剪贴板、粘贴和回车发送链路仍需在用户设备逐一复测。
+- Android 分享接收、悬浮窗权限拒绝/恢复、旋转和 GIF 长按预览尚未进行真机验收。
+- 当前 APK 不适合公开分发；正式发布还需要配置独立签名密钥并更新 applicationId。
+
 ## [未发布] 交互、窗口与留痕整理
 
 ### 新增

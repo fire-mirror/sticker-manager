@@ -30,6 +30,18 @@ if (-not (Test-Path -LiteralPath $flutter)) {
     throw "Flutter executable not found: $flutter"
 }
 
+# Prefer SDK paths already configured in Flutter. This keeps the release
+# command reproducible when Java and the Android SDK are not on global PATH.
+$flutterConfig = $null
+try {
+    $flutterConfig = (& $flutter config --machine 2>$null | ConvertFrom-Json -ErrorAction Stop)
+} catch {
+    # Explicit command-line/environment values remain valid with older SDKs.
+}
+if ([string]::IsNullOrWhiteSpace($androidSdk) -and $flutterConfig.'android-sdk') {
+    $androidSdk = [string]$flutterConfig.'android-sdk'
+}
+
 function Get-JavaMajorVersion {
     param([Parameter(Mandatory)][string]$JdkDirectory)
     $java = Join-Path $JdkDirectory 'bin/java.exe'
@@ -52,6 +64,7 @@ function Get-JavaMajorVersion {
 if ([string]::IsNullOrWhiteSpace($JavaHome)) {
     $candidates = @()
     if ($env:JAVA_HOME) { $candidates += $env:JAVA_HOME }
+    if ($flutterConfig.'jdk-dir') { $candidates += [string]$flutterConfig.'jdk-dir' }
     $candidates += @(
         (Join-Path ${env:ProgramFiles} 'Java/jdk-*'),
         (Join-Path ${env:ProgramFiles} 'Eclipse Adoptium/jdk-*'),

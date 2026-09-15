@@ -18,12 +18,20 @@ class ImportProgress {
     required this.prepared,
     required this.submitted,
     required this.thumbnailsGenerated,
+    this.skippedTooLarge = 0,
+    this.skippedByTotalLimit = 0,
   });
 
   final int total;
   final int prepared;
   final int submitted;
   final int thumbnailsGenerated;
+
+  /// Files rejected before import because they exceeded a per-file limit.
+  final int skippedTooLarge;
+
+  /// Files rejected because accepting them would exceed the batch byte limit.
+  final int skippedByTotalLimit;
 }
 
 class ImportResult {
@@ -32,12 +40,24 @@ class ImportResult {
     required this.duplicates,
     required this.skipped,
     required this.thumbnailsGenerated,
+    this.skippedTooLarge = 0,
+    this.skippedByTotalLimit = 0,
   });
 
   final int added;
   final int duplicates;
   final int skipped;
   final int thumbnailsGenerated;
+
+  /// Number of files skipped by the per-file byte limit. This is additive to
+  /// [skipped], preserving the original result contract for existing callers.
+  final int skippedTooLarge;
+
+  /// Number of files skipped by the aggregate import byte limit. This is
+  /// additive to [skipped], preserving the original result contract.
+  final int skippedByTotalLimit;
+
+  int get sizeLimited => skippedTooLarge + skippedByTotalLimit;
 }
 
 class MediaStore {
@@ -50,6 +70,17 @@ class MediaStore {
 
   static const _prepareConcurrency = 4;
   static const _thumbnailConcurrency = 2;
+
+  /// Keep one malformed or unexpectedly huge source file from exhausting the
+  /// process while still allowing ordinary QQ/WeChat GIFs and images.
+  static const maxImportFileBytes = 64 * 1024 * 1024;
+
+  /// A normal QQ collection (500, or 1,000 for SVIP) is generally well below
+  /// this ceiling. The limit applies to the selected source bytes, before
+  /// hash-based deduplication, so it also bounds transient work and disk use.
+  static const maxImportTotalBytes = 512 * 1024 * 1024;
+
+  static const _readChunkBytes = 64 * 1024;
 
   Future<Directory> get _mediaDirectory async {
     final providedDirectory = _providedMediaDirectory;
@@ -75,20 +106,57 @@ class MediaStore {
     final importGroupIds = groupIds.toSet();
     final target = await _mediaDirectory;
     final outcomes = List<_PreparationOutcome?>.filled(input.length, null);
+    final candidates = <_PreparationInput>[];
+    var reservedTotalBytes = 0;
+    var skippedTooLarge = 0;
+    var skippedByTotalLimit = 0;
+
+    // Stat files before scheduling workers. This prevents a large source from
+    // being read into memory just to discover that it cannot be imported, and
+    // makes the aggregate limit deterministic for a multi-file selection.
+    for (var index = 0; index < input.length; index++) {
+      final file = input[index];
+      final itemSource = sourceForFile?.call(file) ?? source;
+      final length = await _fileLength(file);
+      if (length == null || length <= 0) {
+        outcomes[index] = const _PreparationOutcome.skipped();
+        continue;
+      }
+      if (length > maxImportFileBytes) {
+        outcomes[index] =
+            const _PreparationOutcome.skipped(_PreparationSkipReason.tooLarge);
+        continue;
+      }
+      if (length > maxImportTotalBytes - reservedTotalBytes) {
+        outcomes[index] = const _PreparationOutcome.skipped(
+            _PreparationSkipReason.totalLimit);
+        continue;
+      }
+      reservedTotalBytes += length;
+      candidates.add(_PreparationInput(index, file, itemSource));
+    }
+
     var next = 0;
 
     Future<void> prepareWorker() async {
       while (true) {
-        final index = next++;
-        if (index >= input.length) return;
-        final itemSource = sourceForFile?.call(input[index]) ?? source;
-        outcomes[index] = await _prepare(input[index], itemSource, target,
-            sourceOrder: itemSource == StickerSource.qq ? index : null);
+        final candidateIndex = next++;
+        if (candidateIndex >= candidates.length) return;
+        final candidate = candidates[candidateIndex];
+        outcomes[candidate.inputIndex] = await _prepare(
+          candidate.file,
+          candidate.source,
+          target,
+          sourceOrder: candidate.source == StickerSource.qq
+              ? candidate.inputIndex
+              : null,
+        );
       }
     }
 
-    final workerCount =
-        input.length < _prepareConcurrency ? input.length : _prepareConcurrency;
+    final workerCount = candidates.length < _prepareConcurrency
+        ? candidates.length
+        : _prepareConcurrency;
     if (workerCount > 0) {
       await Future.wait(
           List<Future<void>>.generate(workerCount, (_) => prepareWorker()));
@@ -102,6 +170,11 @@ class MediaStore {
         prepared.add(sticker);
       } else {
         skipped++;
+        if (outcome?.reason == _PreparationSkipReason.tooLarge) {
+          skippedTooLarge++;
+        } else if (outcome?.reason == _PreparationSkipReason.totalLimit) {
+          skippedByTotalLimit++;
+        }
       }
     }
     onProgress?.call(ImportProgress(
@@ -109,6 +182,8 @@ class MediaStore {
       prepared: prepared.length,
       submitted: 0,
       thumbnailsGenerated: 0,
+      skippedTooLarge: skippedTooLarge,
+      skippedByTotalLimit: skippedByTotalLimit,
     ));
 
     if (source == StickerSource.qq ||
@@ -126,6 +201,8 @@ class MediaStore {
       prepared: prepared.length,
       submitted: inserted.length,
       thumbnailsGenerated: 0,
+      skippedTooLarge: skippedTooLarge,
+      skippedByTotalLimit: skippedByTotalLimit,
     ));
 
     final thumbnailsGenerated = await _generateThumbnails(
@@ -136,6 +213,8 @@ class MediaStore {
         prepared: prepared.length,
         submitted: inserted.length,
         thumbnailsGenerated: generated,
+        skippedTooLarge: skippedTooLarge,
+        skippedByTotalLimit: skippedByTotalLimit,
       )),
     );
     return ImportResult(
@@ -143,15 +222,29 @@ class MediaStore {
       duplicates: duplicates,
       skipped: skipped,
       thumbnailsGenerated: thumbnailsGenerated,
+      skippedTooLarge: skippedTooLarge,
+      skippedByTotalLimit: skippedByTotalLimit,
     );
+  }
+
+  Future<int?> _fileLength(File file) async {
+    try {
+      final length = await file.length();
+      return length >= 0 ? length : null;
+    } on Object {
+      return null;
+    }
   }
 
   Future<_PreparationOutcome> _prepare(
       File file, StickerSource source, Directory target,
       {int? sourceOrder}) async {
     try {
-      final bytes = await file.readAsBytes();
-      if (bytes.isEmpty) return const _PreparationOutcome.skipped();
+      final read = await _readBytesWithinLimit(file);
+      if (read.reason != null) {
+        return _PreparationOutcome.skipped(read.reason!);
+      }
+      final bytes = read.bytes!;
       final mediaType = _mediaTypeFor(bytes);
       if (mediaType == null) return const _PreparationOutcome.skipped();
       final hash = sha256.convert(bytes).toString();
@@ -180,6 +273,32 @@ class MediaStore {
       ));
     } on Object {
       return const _PreparationOutcome.skipped();
+    }
+  }
+
+  Future<_ReadFileOutcome> _readBytesWithinLimit(File file) async {
+    RandomAccessFile? handle;
+    try {
+      handle = await file.open();
+      final builder = BytesBuilder(copy: false);
+      var total = 0;
+      while (true) {
+        final chunk = await handle.read(_readChunkBytes);
+        if (chunk.isEmpty) break;
+        total += chunk.length;
+        if (total > maxImportFileBytes) {
+          return const _ReadFileOutcome.skipped(
+              _PreparationSkipReason.tooLarge);
+        }
+        builder.add(chunk);
+      }
+      final bytes = builder.takeBytes();
+      if (bytes.isEmpty) return const _ReadFileOutcome.skipped();
+      return _ReadFileOutcome.data(bytes);
+    } on Object {
+      return const _ReadFileOutcome.skipped();
+    } finally {
+      await handle?.close();
     }
   }
 
@@ -358,10 +477,33 @@ class MediaStore {
 }
 
 class _PreparationOutcome {
-  const _PreparationOutcome(this.sticker);
-  const _PreparationOutcome.skipped() : sticker = null;
+  const _PreparationOutcome(this.sticker) : reason = null;
+  const _PreparationOutcome.skipped([
+    this.reason = _PreparationSkipReason.invalid,
+  ]) : sticker = null;
 
   final Sticker? sticker;
+  final _PreparationSkipReason? reason;
+}
+
+enum _PreparationSkipReason { invalid, tooLarge, totalLimit }
+
+class _PreparationInput {
+  const _PreparationInput(this.inputIndex, this.file, this.source);
+
+  final int inputIndex;
+  final File file;
+  final StickerSource source;
+}
+
+class _ReadFileOutcome {
+  const _ReadFileOutcome.data(this.bytes) : reason = null;
+  const _ReadFileOutcome.skipped([
+    this.reason = _PreparationSkipReason.invalid,
+  ]) : bytes = null;
+
+  final Uint8List? bytes;
+  final _PreparationSkipReason? reason;
 }
 
 class WindowsImportSource implements ImportSource {

@@ -436,6 +436,8 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       var added = 0;
       var duplicates = 0;
       var skipped = 0;
+      var skippedTooLarge = 0;
+      var skippedByTotalLimit = 0;
       for (final selection in selections) {
         final batch = selection.batch;
         if (mounted) {
@@ -451,11 +453,13 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         added += outcome.added;
         duplicates += outcome.duplicates;
         skipped += outcome.skipped;
+        skippedTooLarge += outcome.skippedTooLarge;
+        skippedByTotalLimit += outcome.skippedByTotalLimit;
       }
       await _load();
       if (mounted) {
         _showMessage(
-            '已扫描 ${batches.length} 个明确目录：导入 $added 个，重复 $duplicates 个，跳过 $skipped 个（每个目录最多扫描 ${WindowsImportSource.defaultMaxFiles} 个）');
+            '已扫描 ${batches.length} 个明确目录：导入 $added 个，重复 $duplicates 个，跳过 $skipped 个${_sizeLimitSuffix(skippedTooLarge, skippedByTotalLimit)}（每个目录最多扫描 ${WindowsImportSource.defaultMaxFiles} 个）');
       }
     } on Object catch (error) {
       if (mounted) _showMessage('导入失败：$error');
@@ -522,7 +526,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       await _load();
       if (mounted) {
         _showMessage(
-            '从文件夹导入 ${outcome.added} 个，重复 ${outcome.duplicates} 个，跳过 ${outcome.skipped} 个');
+            '从文件夹导入 ${outcome.added} 个，重复 ${outcome.duplicates} 个，跳过 ${outcome.skipped} 个${_sizeLimitSuffix(outcome.skippedTooLarge, outcome.skippedByTotalLimit)}');
       }
     } on Object catch (error) {
       if (mounted) _showMessage('导入失败：$error');
@@ -578,7 +582,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       );
       if (mounted) {
         _showMessage(
-            '导入 ${outcome.added} 个，重复 ${outcome.duplicates} 个，跳过 ${outcome.skipped} 个');
+            '导入 ${outcome.added} 个，重复 ${outcome.duplicates} 个，跳过 ${outcome.skipped} 个${_sizeLimitSuffix(outcome.skippedTooLarge, outcome.skippedByTotalLimit)}');
       }
     } on Object catch (error) {
       if (mounted) _showMessage('导入失败：$error');
@@ -869,9 +873,12 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       _importStatus = '正在接收分享文件…';
     });
     try {
+      final shareErrors = await PlatformBridge.instance.consumeShareErrors();
       sharedPaths = await PlatformBridge.instance.consumeSharedFiles();
       if (sharedPaths.isEmpty) {
-        if (showEmptyMessage && mounted) {
+        if (mounted && shareErrors.isNotEmpty) {
+          _showMessage(_shareErrorMessage(shareErrors));
+        } else if (showEmptyMessage && mounted) {
           _showMessage('请先从 QQ/微信选择“分享”或保存图片，再返回此处接收。');
         }
         return;
@@ -885,7 +892,11 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       );
       await PlatformBridge.instance.acknowledgeSharedFiles(sharedPaths);
       importCompleted = true;
-      if (mounted) _showMessage('已从分享导入 ${outcome.added} 个表情');
+      if (mounted) {
+        final suffix =
+            shareErrors.isEmpty ? '' : '；${_shareErrorMessage(shareErrors)}';
+        _showMessage('已从分享导入 ${outcome.added} 个表情$suffix');
+      }
     } on Object catch (error) {
       if (mounted) _showMessage('分享导入失败：$error');
     } finally {
@@ -906,6 +917,20 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         _drainQueuedSharedImport();
       }
     }
+  }
+
+  String _shareErrorMessage(List<String> errors) {
+    if (errors.isEmpty) return '';
+    final first = errors.first.trim();
+    final detail = first.isEmpty ? '' : '：$first';
+    return '有 ${errors.length} 个分享文件未接收$detail';
+  }
+
+  String _sizeLimitSuffix(int tooLarge, int totalLimit) {
+    final parts = <String>[];
+    if (tooLarge > 0) parts.add('单文件过大 $tooLarge 个');
+    if (totalLimit > 0) parts.add('批次大小超限 $totalLimit 个');
+    return parts.isEmpty ? '' : '（${parts.join('，')}）';
   }
 
   Future<void> _onSharedFilesAvailable() async {
@@ -1070,7 +1095,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       await _load();
       if (mounted) {
         _showMessage(
-            '恢复 ${outcome.added} 个，重复 ${outcome.duplicates} 个，跳过 ${outcome.skipped} 个');
+            '恢复 ${outcome.added} 个，重复 ${outcome.duplicates} 个，跳过 ${outcome.skipped} 个${_sizeLimitSuffix(outcome.skippedTooLarge, outcome.skippedByTotalLimit)}');
       }
     } on Object catch (error) {
       if (mounted) _showMessage('导入失败：密码错误或文件损坏（$error）');
@@ -1961,6 +1986,8 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                                       itemCount: visible.length,
                                       itemBuilder: (context, index) =>
                                           _StickerCard(
+                                        key: ValueKey<String>(
+                                            visible[index].sticker.id),
                                         entry: visible[index],
                                         selectionMode: _selectionMode,
                                         selected: _selectedStickerIds.contains(
@@ -2301,7 +2328,8 @@ class _SelectionRectPainter extends CustomPainter {
 
 class _StickerCard extends StatefulWidget {
   const _StickerCard(
-      {required this.entry,
+      {super.key,
+      required this.entry,
       required this.selectionMode,
       required this.selected,
       required this.keyboardFocused,
@@ -2345,6 +2373,21 @@ class _StickerCardState extends State<_StickerCard> {
   void dispose() {
     _tapTimer?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant _StickerCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // A pending tap belongs to the card and interaction mode that received
+    // it. Cancel it if Flutter ever reuses this State for another item or if
+    // the parent switches between send and selection modes before the delay
+    // expires.
+    if (oldWidget.entry.sticker.id != widget.entry.sticker.id ||
+        oldWidget.selectionMode != widget.selectionMode) {
+      _tapTimer?.cancel();
+      _tapTimer = null;
+      _lastActionAt = null;
+    }
   }
 
   void _handleTap() {

@@ -440,6 +440,12 @@ bool MatchesCapturedWindowIdentity(HWND window) {
   window = TopLevelWindow(window);
   if (window == nullptr) return false;
 
+  DWORD process_id = 0;
+  GetWindowThreadProcessId(window, &process_id);
+  if (g_captured_process_id == 0 || process_id != g_captured_process_id) {
+    return false;
+  }
+
   if (!g_captured_class.empty()) {
     wchar_t class_name[256] = {};
     GetClassNameW(window, class_name, static_cast<int>(std::size(class_name)));
@@ -447,9 +453,9 @@ bool MatchesCapturedWindowIdentity(HWND window) {
   }
 
   // The original HWND may legitimately keep its identity while a chat title
-  // changes. A different HWND must retain the frozen title when one was
-  // available; otherwise it is only accepted through the unique-candidate
-  // path in FindReplacementExternalWindow().
+  // changes. A different HWND must retain the frozen title; otherwise it is
+  // only accepted through the unique-candidate path in
+  // FindReplacementExternalWindow().
   if (window != g_captured_window && !g_captured_title.empty()) {
     wchar_t title[512] = {};
     GetWindowTextW(window, title, static_cast<int>(std::size(title)));
@@ -529,25 +535,29 @@ bool RestoreCapturedFocus(HWND target) {
 }
 
 bool EnsureCapturedTargetForeground() {
-  const auto captured = TopLevelWindow(g_captured_window);
+  auto captured = TopLevelWindow(g_captured_window);
   if (captured == nullptr || BelongsToCurrentProcess(captured) ||
-      IsShellWindow(captured)) {
+      IsShellWindow(captured) || !MatchesCapturedWindowIdentity(captured)) {
     // This path is only used by the native send methods. Refuse to inject
     // input when no external target was captured instead of sending it to the
     // manager window that currently owns the foreground.
-    return false;
+    captured = ResolveExternalWindow(captured);
+    if (captured == nullptr) return false;
+    g_captured_window = captured;
   }
 
   const auto foreground = TopLevelWindow(GetForegroundWindow());
   if (foreground != captured) {
     if (!ActivateWindow(captured)) return false;
+    captured = TopLevelWindow(g_captured_window);
   } else {
     // The top-level window can remain foreground while its renderer/editor
     // control loses focus after an asynchronous paste. Restore the control
     // captured before the manager took focus when it is still valid.
     RestoreCapturedFocus(captured);
   }
-  return TopLevelWindow(GetForegroundWindow()) == captured;
+  return captured != nullptr && MatchesCapturedWindowIdentity(captured) &&
+         TopLevelWindow(GetForegroundWindow()) == captured;
 }
 
 HGLOBAL CreateFileDrop(const std::wstring& file_path) {
@@ -1133,6 +1143,15 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (message == kRestoreManagementMessage) {
+    if (platform_channel_) {
+      platform_channel_->InvokeMethod(
+          "restoreManagementMode", nullptr);
+    }
+    ShowWindow(hwnd, SW_SHOW);
+    return 0;
+  }
+
   if (message == WM_HOTKEY &&
       static_cast<WPARAM>(wparam) != kHotKeyAvailabilityProbeId) {
     const auto now = GetTickCount64();

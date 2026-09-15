@@ -108,6 +108,22 @@ class PlatformBridge {
     }
   }
 
+  /// Returns share-copy failures recorded by the Android activity. The
+  /// activity persists these while Flutter is not running, so an oversized or
+  /// unreadable URI is reported instead of disappearing silently.
+  Future<List<String>> consumeShareErrors() async {
+    if (!Platform.isAndroid) return const [];
+    try {
+      final result =
+          await _channel.invokeMethod<List<Object?>>('consumeShareErrors');
+      return result?.whereType<String>().toList() ?? const [];
+    } on MissingPluginException {
+      return const [];
+    } on PlatformException {
+      return const [];
+    }
+  }
+
   Future<void> acknowledgeSharedFiles(Iterable<String> files) async {
     if (!Platform.isAndroid) return;
     final paths = files.toList(growable: false);

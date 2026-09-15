@@ -46,6 +46,9 @@ bool ActivateExistingWindow() {
   BringWindowToTop(existing);
   const BOOL foreground = SetForegroundWindow(existing);
   if (attached) AttachThreadInput(current_thread, target_thread, FALSE);
+  // A duplicate launch is a management entry point. Ask the existing Dart
+  // controller to leave quick-picker mode before it is shown.
+  PostMessage(existing, FlutterWindow::kRestoreManagementMessage, 0, 0);
   return foreground != FALSE || GetForegroundWindow() == existing;
 }
 

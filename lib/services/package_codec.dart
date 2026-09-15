@@ -8,6 +8,12 @@ class EncryptedPackageCodec {
   static const _magic = <int>[0x53, 0x4d, 0x50, 0x01];
   static const _saltLength = 16;
 
+  /// Keep malformed local packages from allocating unbounded buffers before
+  /// authenticated decryption can reject them. This is intentionally larger
+  /// than the normal library size, but still finite for a desktop/mobile app.
+  static const maxEncryptedBytes = 768 * 1024 * 1024;
+  static const maxPlainBytes = 512 * 1024 * 1024;
+
   Future<Uint8List> encrypt(List<int> plain, String password) async {
     if (password.length < 8) throw ArgumentError('密码至少需要 8 个字符');
     final salt = Uint8List.fromList(
@@ -19,6 +25,9 @@ class EncryptedPackageCodec {
   }
 
   Future<Uint8List> decrypt(List<int> bytes, String password) async {
+    if (bytes.length > maxEncryptedBytes) {
+      throw const FormatException('迁移包超过允许的大小');
+    }
     if (bytes.length < _magic.length + _saltLength ||
         !_magic
             .asMap()
@@ -35,7 +44,11 @@ class EncryptedPackageCodec {
       nonceLength: algorithm.nonceLength,
       macLength: algorithm.macAlgorithm.macLength,
     );
-    return Uint8List.fromList(await algorithm.decrypt(box, secretKey: key));
+    final plain = await algorithm.decrypt(box, secretKey: key);
+    if (plain.length > maxPlainBytes) {
+      throw const FormatException('迁移包解密内容超过允许的大小');
+    }
+    return Uint8List.fromList(plain);
   }
 
   Future<SecretKey> _deriveKey(String password, List<int> salt) {

@@ -72,6 +72,15 @@ class QuickPickerController with TrayListener, WindowListener {
       } on MissingPluginException {
         _applicationWindow = null;
       }
+      _channel.setMethodCallHandler((call) async {
+        if (call.method == 'restoreManagementMode') {
+          await enterManagementMode(force: true);
+          await windowManager.show();
+          await windowManager.focus();
+          onPickerShown?.call();
+        }
+        return null;
+      });
       final iconData =
           await rootBundle.load('windows/runner/resources/app_icon.ico');
       final temporary = await getTemporaryDirectory();
@@ -102,6 +111,7 @@ class QuickPickerController with TrayListener, WindowListener {
         }
       }
       _hotKeyRegistered = false;
+      _channel.setMethodCallHandler(null);
       trayManager.removeListener(this);
       windowManager.removeListener(this);
       _windowStateSaveTimer?.cancel();
@@ -519,6 +529,7 @@ class QuickPickerController with TrayListener, WindowListener {
       await hotKeyManager.unregister(hotKey);
     }
     _hotKeyRegistered = false;
+    _channel.setMethodCallHandler(null);
     await trayManager.destroy();
   }
 
