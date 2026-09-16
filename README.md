@@ -93,6 +93,10 @@ To build both release artifacts and create a Windows zip package, run:
 powershell -ExecutionPolicy Bypass -File .\tool\build_release.ps1
 ```
 
+The Windows zip includes `README_FIRST.txt` and `Start-StickerManager.cmd` at
+the package root. After extracting it, double-click the command file or
+`sticker_manager.exe`; no installer or administrator permission is required.
+
 To install the Windows Release directory for the current user without
 administrator access, run:
 

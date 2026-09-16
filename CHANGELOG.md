@@ -11,11 +11,12 @@
 - Windows/Android 导入增加单文件 `64 MiB`、批次 `512 MiB` 上限；分享 URI 使用有界流读取，超限和读取失败会在应用中提示。
 - 加密迁移包增加密文 `768 MiB`、明文 `512 MiB` 上限，以及 manifest、媒体类型、哈希、分组 ID 和路径校验；导入完成后释放已处理归档内容。
 - 发布脚本优先读取 `flutter config --machine` 中的 JDK 和 Android SDK。此次 Android 构建使用 JDK 17.0.20.1，不依赖系统 Java 11。
+- Windows ZIP 根目录增加 `README_FIRST.txt` 和 `Start-StickerManager.cmd`，解压后可以按说明直接启动，无需安装程序或管理员权限。
 
 ### 构建产物
 
 - Windows x64 便携包：`dist/sticker-manager-windows-x64-0.1.0+1.zip`
-  - SHA-256：`AF9D9F82FE67142A16CF6C0E68FC04D5B8731FA07712D3237513A8DFC734DDA6`
+  - SHA-256：`FFCC7732A53BFF7F8C34983A8981962F865CEF22C7DB875AF94483ABDBA7C339`
 - Android APK：`build/app/outputs/flutter-apk/app-release.apk`
   - SHA-256：`DDE2ABDD0CE5D1DEC6777EC50BCB1690745B6EBEFAE38FBFA8324BD3F7294C21`
   - `minSdkVersion 28`、`targetSdkVersion 36`，包含 `arm64-v8a`、`armeabi-v7a` 和 `x86_64`。

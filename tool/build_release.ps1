@@ -136,14 +136,22 @@ $version = (Get-Content (Join-Path $projectRoot 'pubspec.yaml') | Select-String 
 $windowsOutput = Join-Path $projectRoot 'build/windows/x64/runner/Release'
 $dist = Join-Path $projectRoot 'dist'
 $archive = Join-Path $dist "sticker-manager-windows-x64-$version.zip"
+$releaseReadme = Join-Path $projectRoot 'tool/release/README_FIRST.txt'
+$releaseLauncher = Join-Path $projectRoot 'tool/release/Start-StickerManager.cmd'
 if (-not (Test-Path -LiteralPath (Join-Path $windowsOutput 'sticker_manager.exe'))) {
     throw "Windows release executable was not produced: $windowsOutput"
+}
+foreach ($supportFile in @($releaseReadme, $releaseLauncher)) {
+    if (-not (Test-Path -LiteralPath $supportFile)) {
+        throw "Windows package support file was not found: $supportFile"
+    }
 }
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 if (Test-Path -LiteralPath $archive) {
     Remove-Item -LiteralPath $archive -Force
 }
 Compress-Archive -Path (Join-Path $windowsOutput '*') -DestinationPath $archive -CompressionLevel Optimal
+Compress-Archive -Path $releaseReadme, $releaseLauncher -DestinationPath $archive -Update
 
 Write-Output "Windows package: $archive"
 Write-Output "Android APK: $(Join-Path $projectRoot 'build/app/outputs/flutter-apk/app-release.apk')"
