@@ -14,6 +14,13 @@ const required = [
   'lib/platform/platform_bridge.dart',
   'android/app/src/main/AndroidManifest.xml',
   'android/app/src/main/kotlin/com/example/sticker_manager/MainActivity.kt',
+  'macos/Runner/MainFlutterWindow.swift',
+  'macos/Runner/AppDelegate.swift',
+  'macos/Runner.xcodeproj/project.pbxproj',
+  'macos/Runner/Release.entitlements',
+  'tool/generate_macos_icons.sh',
+  '.github/workflows/ci.yml',
+  'tool/build_macos.sh',
   'tool/install_windows.ps1',
   'tool/uninstall_windows.ps1',
 ];
@@ -29,8 +36,8 @@ for (const dependency of ['sqflite', 'crypto', 'cryptography', 'file_picker', 'h
     process.exit(1);
   }
 }
-const mainDart = readFileSync(join(root, 'lib/main.dart'), 'utf8');
-if (!mainDart.includes('FilePicker.pickFiles(')) {
+const libraryPage = readFileSync(join(root, 'lib/ui/library_page.dart'), 'utf8');
+if (!libraryPage.includes('FilePicker.pickFiles(')) {
   console.error('File import must allow selecting multiple stickers');
   process.exit(1);
 }
